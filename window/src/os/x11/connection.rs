@@ -61,6 +61,7 @@ pub struct XConnection {
     pub atom_wm_change_state: Atom,
     pub atom_utf8_string: Atom,
     pub atom_xsel_data: Atom,
+    pub atom_incr: Atom,
     pub atom_targets: Atom,
     pub atom_clipboard: Atom,
     pub atom_texturilist: Atom,
@@ -679,6 +680,7 @@ impl XConnection {
         let atom_wm_change_state = Self::intern_atom(&conn, "WM_CHANGE_STATE")?;
         let atom_utf8_string = Self::intern_atom(&conn, "UTF8_STRING")?;
         let atom_xsel_data = Self::intern_atom(&conn, "XSEL_DATA")?;
+        let atom_incr = Self::intern_atom(&conn, "INCR")?;
         let atom_targets = Self::intern_atom(&conn, "TARGETS")?;
         let atom_clipboard = Self::intern_atom(&conn, "CLIPBOARD")?;
         let atom_texturilist = Self::intern_atom(&conn, "text/uri-list")?;
@@ -858,6 +860,7 @@ impl XConnection {
             kbd_ev,
             atom_utf8_string,
             atom_xsel_data,
+            atom_incr,
             atom_targets,
             windows: RefCell::new(HashMap::new()),
             child_to_parent_id: RefCell::new(HashMap::new()),
