@@ -697,7 +697,7 @@ impl XWindowInner {
                         property: conn.atom_xdndtypelist,
                         r#type: xcb::x::ATOM_ATOM,
                         long_offset: 0,
-                        long_length: u32::max_value(),
+                        long_length: u32::MAX,
                     }) {
                         Ok(prop) => prop.value::<Atom>().to_vec(),
                         Err(err) => {
@@ -1289,7 +1289,7 @@ impl XWindowInner {
                     property: selection.property(),
                     r#type: selection.target(),
                     long_offset: 0,
-                    long_length: u32::max_value(),
+                    long_length: u32::MAX,
                 }) {
                     Ok(prop) => {
                         if selection.target() == conn.atom_utf8_string {
