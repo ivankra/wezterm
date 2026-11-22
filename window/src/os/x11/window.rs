@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use url::Url;
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::{KeyCode, KeyEvent, KeyboardLedStatus, Modifiers};
@@ -35,8 +36,20 @@ struct CopyAndPaste {
     primary_selection_owned: Option<String>,
     clipboard_request: Option<SelectionRequest>,
     selection_request: Option<SelectionRequest>,
+    /// Requestor windows whose transfer completed, available for reuse,
+    /// with the timestamp of that transfer.
+    spare_requestors: Vec<(xcb::x::Window, u32)>,
+    /// Requestor windows of abandoned transfers, and when they were
+    /// abandoned; destroyed once their owner has had time to give up.
+    retired_requestors: Vec<(xcb::x::Window, Instant)>,
     time: u32,
 }
+
+/// How long to wait after abandoning a transfer before destroying its
+/// requestor window.  Some selection owners, notably xsel, exit on a
+/// BadWindow error, taking the selection with them, if the requestor is
+/// destroyed while they are still using it.
+const RETIRED_REQUESTOR_GRACE: Duration = Duration::from_secs(30);
 
 impl CopyAndPaste {
     fn clipboard(&self, clipboard: Clipboard) -> &Option<String> {
@@ -68,6 +81,13 @@ struct SelectionRequest {
     requestor: xcb::x::Window,
     target: Atom,
     data: SelectionData,
+    /// The timestamp of our ConvertSelection request
+    time: u32,
+    /// When the requestor is reused, the timestamp of the read it was used
+    /// for previously. xsel sends a final SelectionNotify after completing
+    /// an INCR transfer, which can arrive after we've already reused the
+    /// requestor for the next read; this lets us recognize and ignore it.
+    stale_time: Option<u32>,
 }
 
 impl SelectionRequest {
@@ -77,6 +97,8 @@ impl SelectionRequest {
             requestor: xcb::x::Window::none(),
             target: xcb::x::ATOM_NONE,
             data: SelectionData::default(),
+            time: 0,
+            stale_time: None,
         }
     }
 }
@@ -227,6 +249,7 @@ impl Drop for XWindowInner {
     fn drop(&mut self) {
         self.finish_selection(Clipboard::Clipboard, None);
         self.finish_selection(Clipboard::PrimarySelection, None);
+        self.reap_requestors(true);
         if self.window_id != xcb::x::Window::none() {
             if let Some(conn) = self.conn.upgrade() {
                 self.conn()
@@ -903,6 +926,7 @@ impl XWindowInner {
             Event::X(xcb::x::Event::DestroyNotify(e)) if e.window() == self.window_id => {
                 self.finish_selection(Clipboard::Clipboard, None);
                 self.finish_selection(Clipboard::PrimarySelection, None);
+                self.reap_requestors(true);
                 self.events.dispatch(WindowEvent::Destroyed);
                 conn.windows.borrow_mut().remove(&self.window_id);
                 conn.child_to_parent_id.borrow_mut().remove(&self.child_id);
@@ -1177,22 +1201,68 @@ impl XWindowInner {
         Ok(())
     }
 
-    /// Retire the requestor before another read can start. Late events from its
-    /// owner will no longer route to this window.
+    /// Detach the requestor before another read can start. Late events from its
+    /// owner will no longer match a request.
+    ///
+    /// The requestor window is not destroyed here: the owner may still be
+    /// using it (xsel, for example, touches it again after we read the final
+    /// INCR chunk, and exits on BadWindow). A requestor whose transfer
+    /// completed is reused for the next read; one whose transfer was
+    /// abandoned or failed may still receive chunks, so it is retired and
+    /// destroyed later by reap_requestors.
     fn finish_selection(&mut self, clipboard: Clipboard, result: Option<anyhow::Result<String>>) {
         if let Some(mut request) = self.copy_and_paste.request_mut(clipboard).take() {
-            if let Some(conn) = self.conn.upgrade() {
-                if !request.requestor.is_none() {
-                    conn.child_to_parent_id
-                        .borrow_mut()
-                        .remove(&request.requestor);
-                    conn.send_request_no_reply_log(&xcb::x::DestroyWindow {
-                        window: request.requestor,
-                    });
+            if !request.requestor.is_none() {
+                if matches!(result, Some(Ok(_))) {
+                    self.copy_and_paste
+                        .spare_requestors
+                        .push((request.requestor, request.time));
+                } else {
+                    self.copy_and_paste
+                        .retired_requestors
+                        .push((request.requestor, Instant::now()));
                 }
             }
             if let Some(result) = result {
                 request.promise.take().unwrap().result(result);
+            }
+        }
+    }
+
+    /// Destroy retired requestor windows once their grace period has
+    /// elapsed, or all requestor windows if `all` is true.
+    fn reap_requestors(&mut self, all: bool) {
+        let mut doomed = vec![];
+        if all {
+            doomed.extend(
+                self.copy_and_paste
+                    .spare_requestors
+                    .drain(..)
+                    .map(|(w, _)| w),
+            );
+            doomed.extend(
+                self.copy_and_paste
+                    .retired_requestors
+                    .drain(..)
+                    .map(|(w, _)| w),
+            );
+        } else {
+            self.copy_and_paste.retired_requestors.retain(|&(w, when)| {
+                if when.elapsed() >= RETIRED_REQUESTOR_GRACE {
+                    doomed.push(w);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if doomed.is_empty() {
+            return;
+        }
+        if let Some(conn) = self.conn.upgrade() {
+            for window in doomed {
+                conn.child_to_parent_id.borrow_mut().remove(&window);
+                conn.send_request_no_reply_log(&xcb::x::DestroyWindow { window });
             }
         }
     }
@@ -1241,7 +1311,9 @@ impl XWindowInner {
             let request = match self.copy_and_paste.request_mut(clipboard).as_mut() {
                 Some(request)
                     if request.requestor == selection.requestor()
-                        && request.target == selection.target() =>
+                        && request.target == selection.target()
+                        && (request.stale_time != Some(selection.time())
+                            || request.time == selection.time()) =>
                 {
                     request
                 }
@@ -1259,7 +1331,7 @@ impl XWindowInner {
                         selection: selection.selection(),
                         target: xcb::x::ATOM_STRING,
                         property: conn.atom_xsel_data,
-                        time: self.copy_and_paste.time,
+                        time: request.time,
                     });
                     if let Err(err) = result {
                         self.finish_selection(clipboard, Some(Err(err)));
@@ -1734,6 +1806,7 @@ impl XWindowInner {
     fn close(&mut self) {
         self.finish_selection(Clipboard::Clipboard, None);
         self.finish_selection(Clipboard::PrimarySelection, None);
+        self.reap_requestors(true);
         let conn = self.conn();
         conn.flush()
             .context("flush pending requests prior to issuing DestroyWindow")
@@ -2282,25 +2355,36 @@ impl WindowOps for XWindow {
             );
             let conn = inner.conn();
             inner.finish_selection(clipboard, None);
-            let requestor = conn.generate_id();
-            conn.send_request_no_reply(&xcb::x::CreateWindow {
-                depth: 0,
-                wid: requestor,
-                parent: conn.root,
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-                border_width: 0,
-                class: xcb::x::WindowClass::InputOnly,
-                visual: 0,
-                value_list: &[xcb::x::Cw::EventMask(xcb::x::EventMask::PROPERTY_CHANGE)],
-            })?;
+            inner.reap_requestors(false);
+            let requestor = match inner.copy_and_paste.spare_requestors.pop() {
+                Some((requestor, stale_time)) => {
+                    request.stale_time = Some(stale_time);
+                    requestor
+                }
+                None => {
+                    let requestor = conn.generate_id();
+                    conn.send_request_no_reply(&xcb::x::CreateWindow {
+                        depth: 0,
+                        wid: requestor,
+                        parent: conn.root,
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                        border_width: 0,
+                        class: xcb::x::WindowClass::InputOnly,
+                        visual: 0,
+                        value_list: &[xcb::x::Cw::EventMask(xcb::x::EventMask::PROPERTY_CHANGE)],
+                    })?;
+                    conn.child_to_parent_id
+                        .borrow_mut()
+                        .insert(requestor, inner.window_id);
+                    requestor
+                }
+            };
             request.requestor = requestor;
             request.target = conn.atom_utf8_string;
-            conn.child_to_parent_id
-                .borrow_mut()
-                .insert(requestor, inner.window_id);
+            request.time = inner.copy_and_paste.time;
             inner.copy_and_paste.request_mut(clipboard).replace(request);
             // Find the owner and ask them to send us the buffer
             let result = conn.send_request_no_reply(&xcb::x::ConvertSelection {
